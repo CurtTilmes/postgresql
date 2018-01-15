@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include "libpq-fe.h"
 #include "libpq-int.h"
@@ -4492,10 +4493,14 @@ parseServiceInfo(PQconninfoOption *options, PQExpBuffer errorMessage)
 {
 	const char *service = conninfo_getval(options, "service");
 	char		serviceFile[MAXPGPATH];
+	char		serviceDirPath[MAXPGPATH];
 	char	   *env;
 	bool		group_found = false;
 	int			status;
 	struct stat stat_buf;
+	DIR		   *serviceDir;
+	struct dirent *direntry;
+
 
 	/*
 	 * We have to special-case the environment variable PGSERVICE here, since
@@ -4539,21 +4544,45 @@ next_file:
 	snprintf(serviceFile, MAXPGPATH, "%s/pg_service.conf",
 			 getenv("PGSYSCONFDIR") ? getenv("PGSYSCONFDIR") : SYSCONFDIR);
 	if (stat(serviceFile, &stat_buf) != 0)
-		goto last_file;
+		goto conf_dir;
 
 	status = parseServiceFile(serviceFile, service, options, errorMessage, &group_found);
-	if (status != 0)
+	if (group_found || status != 0)
 		return status;
 
-last_file:
-	if (!group_found)
-	{
-		printfPQExpBuffer(errorMessage,
-						  libpq_gettext("definition of service \"%s\" not found\n"), service);
-		return 3;
-	}
+conf_dir:
 
-	return 0;
+	/*
+	 * Try every file in pg_service.conf.d/*
+	 */
+	snprintf(serviceDirPath, MAXPGPATH, "%s/pg_service.conf.d",
+			 getenv("PGSYSCONFDIR") ? getenv("PGSYSCONFDIR") : SYSCONFDIR);
+
+	if (stat(serviceDirPath, &stat_buf) != 0 || !S_ISDIR(stat_buf.st_mode) ||
+		(serviceDir = opendir(serviceDirPath)) == NULL)
+		goto last_file;
+
+	while ((direntry = readdir(serviceDir)) != NULL)
+	{
+		snprintf(serviceFile, MAXPGPATH, "%s/%s", serviceDirPath, direntry->d_name);
+
+		if (stat(serviceFile, &stat_buf) != 0 || !S_ISREG(stat_buf.st_mode) ||
+			access(serviceFile, R_OK))
+			continue;
+
+		status = parseServiceFile(serviceFile, service, options, errorMessage, &group_found);
+		if (group_found || status != 0)
+		{
+			closedir(serviceDir);
+			return status;
+		}
+	}
+	closedir(serviceDir);
+
+last_file:
+	printfPQExpBuffer(errorMessage,
+					  libpq_gettext("definition of service \"%s\" not found\n"), service);
+	return 3;
 }
 
 static int
